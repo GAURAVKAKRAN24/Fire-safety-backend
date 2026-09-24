@@ -1,7 +1,11 @@
 from sqlalchemy import create_engine, text
+import os
+from dotenv import load_dotenv
 
-DATABASE_URL = "postgresql://postgres:12345@localhost:5432/fire_safety_db"
+load_dotenv()
 
+# DATABASE_URL = "postgresql://postgres:12345@localhost:5432/fire_safety_db"
+DATABASE_URL: str | None = str(os.getenv("DATABASE_URL"))
 engine = create_engine(DATABASE_URL)
 
 try:
