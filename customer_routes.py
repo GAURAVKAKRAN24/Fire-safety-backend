@@ -1,63 +1,81 @@
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import date, timedelta
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
 from database import engine
-from models import Customer, Extinguisher, Service, Notification
+from models import Customer, Extinguisher, Service, Notification, User
 from schemas import CustomerCreate, ExtinguisherCreate, ServiceCreate
-from datetime import date, timedelta
+from auth_dependencies import get_current_user, get_db
 
 router = APIRouter()
 
-def get_db():
-    db = Session(engine)
-    try:
-        yield db
-    finally:
-        db.close()
 
-# API endpoints for customer and extinguisher management
-
-
-# Customer Search by name or mobile number endpoint
+# -------------------------------------------------------------
+# Customer Endpoints
+# -------------------------------------------------------------
 
 @router.get("/customers/search")
 def search_customers(
     q: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    customers = db.query(Customer).filter(
-        (Customer.name.ilike(f"%{q}%")) |
-        (Customer.phone.ilike(f"%{q}%"))
-    ).all()
-
+    query_str = f"%{q.strip()}%"
+    customers = (
+        db.query(Customer)
+        .filter(
+            Customer.user_id == current_user.id,
+            (Customer.name.ilike(query_str) | Customer.phone.ilike(query_str))
+        )
+        .all()
+    )
     return customers
 
 
-# Search for extinguishers by extinguisher number or type endpoint
-
-@router.get("/extinguishers/search")
-def search_extinguishers(
-    q: str,
-    db: Session = Depends(get_db)
+@router.get("/customers")
+def get_customers(
+    page: int = 1,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    extinguishers = db.query(Extinguisher).filter(
-        (Extinguisher.extinguisher_no.ilike(f"%{q}%")) |
-        (Extinguisher.type.ilike(f"%{q}%"))
-    ).all()
+    if page < 1:
+        page = 1
 
-    return extinguishers
+    if limit < 1:
+        limit = 10
 
-# Customer post and get endpoints
+    query = db.query(Customer).filter(Customer.user_id == current_user.id)
+    total = query.count()
+
+    customers = (
+        query
+        .order_by(Customer.id.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "customers": customers
+    }
+
 
 @router.post("/customers")
 def create_customer(
     customer: CustomerCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     new_customer = Customer(
         name=customer.name,
         phone=customer.phone,
-        address=customer.address
+        address=customer.address,
+        user_id=current_user.id
     )
     db.add(new_customer)
     db.commit()
@@ -65,43 +83,49 @@ def create_customer(
     return new_customer
 
 
-# Delete Customer by ID endpoint
-
-@router.delete("/customers/{customer_id}")
-def delete_customer(
+@router.get("/customers/{customer_id}")
+def get_customer(
     customer_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
-    db.delete(customer)
-    db.commit()
+    return customer
 
-    return {"message": "Customer deleted successfully"}
-
-# Customer update by ID endpoint
 
 @router.put("/customers/{customer_id}")
 def update_customer(
     customer_id: int,
     customer: CustomerCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    existing_customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
+    existing_customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not existing_customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
@@ -115,46 +139,73 @@ def update_customer(
     return existing_customer
 
 
-# get customer by ID endpoint
-
-@router.get("/customers/{customer_id}")
-def get_customer(
+@router.delete("/customers/{customer_id}")
+def delete_customer(
     customer_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
-    return customer
+    # 1. Delete notifications for this customer
+    db.query(Notification).filter(Notification.customer_id == customer_id).delete(synchronize_session=False)
 
+    # 2. Get customer extinguisher IDs
+    extinguisher_ids = [
+        e.id for e in db.query(Extinguisher.id).filter(Extinguisher.customer_id == customer_id).all()
+    ]
 
-# get detail of all extinguishers and services for a particular customer endpoint
+    if extinguisher_ids:
+        # Delete services for these extinguishers
+        db.query(Service).filter(Service.extinguisher_id.in_(extinguisher_ids)).delete(synchronize_session=False)
+        # Delete extinguishers
+        db.query(Extinguisher).filter(Extinguisher.id.in_(extinguisher_ids)).delete(synchronize_session=False)
+
+    db.delete(customer)
+    db.commit()
+
+    return {"message": "Customer deleted successfully"}
+
 
 @router.get("/customers/{customer_id}/details")
 def get_customer_details(
     customer_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
-    extinguishers = db.query(Extinguisher).filter(
-        Extinguisher.customer_id == customer_id
-    ).all()
+    extinguishers = (
+        db.query(Extinguisher)
+        .filter(Extinguisher.customer_id == customer_id)
+        .all()
+    )
 
     return {
         "customer": customer,
@@ -162,20 +213,24 @@ def get_customer_details(
     }
 
 
-# Customer service history endpoint
-
 @router.get("/customers/{customer_id}/service-history")
 def get_customer_service_history(
     customer_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
@@ -198,7 +253,6 @@ def get_customer_service_history(
     )
 
     result = []
-
     for service, extinguisher_no, extinguisher_type, capacity in services:
         result.append({
             "service": service,
@@ -216,29 +270,36 @@ def get_customer_service_history(
         "services": result
     }
 
-# Specific extinguisher details for a particular customer endpoint Dashboard
 
 @router.get("/customers/{customer_id}/dashboard")
 def get_customer_dashboard(
     customer_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
     today = date.today()
     next_30_days = today + timedelta(days=30)
 
-    extinguishers = db.query(Extinguisher).filter(
-        Extinguisher.customer_id == customer_id
-    ).all()
+    extinguishers = (
+        db.query(Extinguisher)
+        .filter(Extinguisher.customer_id == customer_id)
+        .all()
+    )
 
     services = (
         db.query(Service)
@@ -259,14 +320,16 @@ def get_customer_dashboard(
         if not extinguisher.next_service_date:
             continue
 
-        service_date = date.fromisoformat(
-            str(extinguisher.next_service_date)
-        )
-
-        if service_date <= today:
-            due_count += 1
-        elif service_date <= next_30_days:
-            upcoming_count += 1
+        try:
+            service_date = date.fromisoformat(
+                str(extinguisher.next_service_date)
+            )
+            if service_date <= today:
+                due_count += 1
+            elif service_date <= next_30_days:
+                upcoming_count += 1
+        except ValueError:
+            continue
 
     return {
         "customer": customer,
@@ -277,73 +340,135 @@ def get_customer_dashboard(
     }
 
 
-# Customer get endpoint
-
-@router.get("/customers")
-def get_customers(
-    page: int = 1,
-    limit: int = 10,
-    db: Session = Depends(get_db)
+@router.get("/customers/{customer_id}/extinguishers")
+def get_customer_extinguishers(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    if page < 1:
-        page = 1
-
-    if limit < 1:
-        limit = 10
-
-    total = db.query(Customer).count()
-
-    customers = (
+    customer = (
         db.query(Customer)
-        .offset((page - 1) * limit)
-        .limit(limit)
-        .all()
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
     )
-
-    return {
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "customers": customers
-    }
-
-
-# Extinguisher post endpoint
-
-@router.post("/extinguishers")
-def create_extinguisher(
-    extinguisher: ExtinguisherCreate,
-    db: Session = Depends(get_db)
-):
-    customer = db.query(Customer).filter(
-        Customer.id == extinguisher.customer_id
-    ).first()
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
-    new_extinguisher = Extinguisher(
-        **extinguisher.model_dump()  # We are unpacking the request data into the Extinguisher model using model_dump() method otherwise we have to map each field manually
+    extinguishers = (
+        db.query(Extinguisher)
+        .filter(Extinguisher.customer_id == customer_id)
+        .all()
+    )
+    return extinguishers
+
+
+@router.get("/customers/{customer_id}/services")
+def get_customer_services(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
     )
 
-    db.add(new_extinguisher)
-    db.commit()
-    db.refresh(new_extinguisher)
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer does not exist"
+        )
 
-    return new_extinguisher
+    services = (
+        db.query(Service)
+        .join(
+            Extinguisher,
+            Service.extinguisher_id == Extinguisher.id
+        )
+        .filter(
+            Extinguisher.customer_id == customer_id
+        )
+        .all()
+    )
+    return services
 
 
-# Extinguisher get endpoint
+@router.get("/customers/{customer_id}/notifications")
+def get_customer_notifications(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer does not exist"
+        )
+
+    notifications = (
+        db.query(Notification)
+        .filter(
+            Notification.customer_id == customer_id
+        )
+        .order_by(
+            Notification.created_at.desc()
+        )
+        .all()
+    )
+
+    return notifications
+
+
+# -------------------------------------------------------------
+# Extinguisher Endpoints
+# -------------------------------------------------------------
+
+@router.get("/extinguishers/search")
+def search_extinguishers(
+    q: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query_str = f"%{q.strip()}%"
+    extinguishers = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Customer.user_id == current_user.id,
+            (Extinguisher.extinguisher_no.ilike(query_str) | Extinguisher.type.ilike(query_str))
+        )
+        .all()
+    )
+    return extinguishers
+
 
 @router.get("/extinguishers")
 def get_extinguishers(
     page: int = 1,
     limit: int = 10,
     status: str | None = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     if page < 1:
         page = 1
@@ -351,17 +476,22 @@ def get_extinguishers(
     if limit < 1:
         limit = 10
 
-    query = db.query(Extinguisher)
+    query = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(Customer.user_id == current_user.id)
+    )
 
     if status:
         query = query.filter(
-            func.lower(Extinguisher.status) == status.lower()
+            func.lower(Extinguisher.status) == status.strip().lower()
         )
 
     total = query.count()
 
     extinguishers = (
         query
+        .order_by(Extinguisher.id.desc())
         .offset((page - 1) * limit)
         .limit(limit)
         .all()
@@ -373,11 +503,59 @@ def get_extinguishers(
         "total": total,
         "extinguishers": extinguishers
     }
-    
+
+
+@router.post("/extinguishers")
+def create_extinguisher(
+    extinguisher: ExtinguisherCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == extinguisher.customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer does not exist"
+        )
+
+    new_extinguisher = Extinguisher(
+        customer_id=extinguisher.customer_id,
+        extinguisher_no=extinguisher.extinguisher_no,
+        type=extinguisher.type,
+        capacity=extinguisher.capacity,
+        purchase_date=extinguisher.purchase_date,
+        last_service_date=extinguisher.last_service_date,
+        next_service_date=extinguisher.next_service_date,
+        status=extinguisher.status or "Active"
+    )
+
+    db.add(new_extinguisher)
+    db.commit()
+    db.refresh(new_extinguisher)
+
+    return new_extinguisher
+
+
 @router.get("/extinguishers/due") 
-def get_due_extinguishers(db: Session = Depends(get_db)):
+def get_due_extinguishers(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     today = date.today() 
-    extinguishers = db.query(Extinguisher).all() 
+    extinguishers = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(Customer.user_id == current_user.id)
+        .all()
+    ) 
     due_extinguishers = [] 
 
     for extinguisher in extinguishers:
@@ -385,21 +563,29 @@ def get_due_extinguishers(db: Session = Depends(get_db)):
             continue
 
         try:
-            service_date = date.fromisoformat(extinguisher.next_service_date)
+            service_date = date.fromisoformat(str(extinguisher.next_service_date))
+            if service_date <= today:
+                due_extinguishers.append(extinguisher) 
         except ValueError:
             continue
 
-    if service_date <= today:
-        due_extinguishers.append(extinguisher) 
     return due_extinguishers
 
 
 @router.get("/extinguishers/upcoming")
-def get_upcoming_extinguishers(db: Session = Depends(get_db)):
+def get_upcoming_extinguishers(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     today = date.today()
     next_30_days = today + timedelta(days=30)
 
-    extinguishers = db.query(Extinguisher).all()
+    extinguishers = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(Customer.user_id == current_user.id)
+        .all()
+    )
 
     upcoming_extinguishers = []
 
@@ -407,52 +593,76 @@ def get_upcoming_extinguishers(db: Session = Depends(get_db)):
         if not extinguisher.next_service_date:
             continue
 
-        service_date = date.fromisoformat(str(extinguisher.next_service_date))
-
-        if today < service_date <= next_30_days:
-            upcoming_extinguishers.append(extinguisher)
+        try:
+            service_date = date.fromisoformat(str(extinguisher.next_service_date))
+            if today < service_date <= next_30_days:
+                upcoming_extinguishers.append(extinguisher)
+        except ValueError:
+            continue
 
     return upcoming_extinguishers
 
 
-# get extinguishers by extinguisher id endpoint
-
 @router.get("/extinguishers/{extinguisher_id}")
-def get_extinguisher_by_id(extinguisher_id: int, db: Session = Depends(get_db)):
-    extinguisher = db.query(Extinguisher).filter(Extinguisher.id == extinguisher_id).first()
+def get_extinguisher_by_id(
+    extinguisher_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == extinguisher_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
     if not extinguisher:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Extinguisher not found"
         )
+
     return extinguisher
 
-
-# Update extinguisher by ID endpoint
 
 @router.put("/extinguishers/{extinguisher_id}")
 def update_extinguisher(
     extinguisher_id: int,
     extinguisher: ExtinguisherCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    existing_extinguisher = db.query(Extinguisher).filter(
-        Extinguisher.id == extinguisher_id
-    ).first()
+    existing_extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == extinguisher_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not existing_extinguisher:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Extinguisher does not exist"
         )
 
-    customer = db.query(Customer).filter(
-        Customer.id == extinguisher.customer_id
-    ).first()
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.id == extinguisher.customer_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not customer:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Customer does not exist"
         )
 
@@ -471,108 +681,112 @@ def update_extinguisher(
     return existing_extinguisher
 
 
-# get extinguishers by customer id endpoint
-
-@router.get("/customers/{customer_id}/extinguishers")
-def get_customer_extinguishers(customer_id: int, db: Session = Depends(get_db)):
-    extinguishers = db.query(Extinguisher).filter(Extinguisher.customer_id == customer_id).all()
-    return extinguishers
-
-
-# Service post endpoint
-
-@router.post("/services")
-def create_service(
-    service: ServiceCreate,
-    db: Session = Depends(get_db)
+@router.delete("/extinguishers/{extinguisher_id}")
+def delete_extinguisher(
+    extinguisher_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-
-    extinguisher = db.query(Extinguisher).filter(Extinguisher.id == service.extinguisher_id).first()
-
-    if not extinguisher:  # Check if the extinguisher exists in the database
-        raise HTTPException(
-            status_code=404,
-            detail="Extinguisher does not exist"
+    extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == extinguisher_id,
+            Customer.user_id == current_user.id
         )
-
-    new_service = Service(                            # Same like line number 62 in extinguisher post endpoint, we are unpacking the request data into the Service model using model_dump() method otherwise we have to map each field manually
-        extinguisher_id=service.extinguisher_id,
-        service_type=service.service_type,
-        service_date=service.service_date,
-        next_service_date=service.next_service_date,
-        amount=service.amount,
-        remarks=service.remarks
+        .first()
     )
-    db.add(new_service)
-
-    # Update extinguisher dates
-    extinguisher.last_service_date = service.service_date
-    extinguisher.next_service_date = service.next_service_date
-
-    old_notifications = db.query(Notification).filter(
-        Notification.extinguisher_id == service.extinguisher_id,
-        Notification.notification_type == "SERVICE_DUE",
-        Notification.is_read == False
-    ).all()
-
-    for notification in old_notifications:
-        notification.is_read = True
-
-    db.commit()
-    db.refresh(new_service)
-    return new_service
-
-
-# Get service by service id endpoint
-
-@router.put("/services/{service_id}")
-def update_service(
-    service_id: int,
-    service: ServiceCreate,
-    db: Session = Depends(get_db)
-):
-    existing_service = db.query(Service).filter(
-        Service.id == service_id
-    ).first()
-
-    if not existing_service:
-        raise HTTPException(
-            status_code=404,
-            detail="Service does not exist"
-        )
-
-    extinguisher = db.query(Extinguisher).filter(
-        Extinguisher.id == service.extinguisher_id
-    ).first()
 
     if not extinguisher:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Extinguisher does not exist"
         )
 
-    existing_service.extinguisher_id = service.extinguisher_id
-    existing_service.service_type = service.service_type
-    existing_service.service_date = service.service_date
-    existing_service.next_service_date = service.next_service_date
-    existing_service.amount = service.amount
-    existing_service.remarks = service.remarks
+    db.query(Notification).filter(Notification.extinguisher_id == extinguisher_id).delete(synchronize_session=False)
+    db.query(Service).filter(Service.extinguisher_id == extinguisher_id).delete(synchronize_session=False)
 
-    extinguisher.last_service_date = service.service_date
-    extinguisher.next_service_date = service.next_service_date
-
+    db.delete(extinguisher)
     db.commit()
-    db.refresh(existing_service)
 
-    return existing_service
+    return {"message": "Extinguisher deleted successfully"}
 
-# Service get endpoint
+
+@router.get("/extinguishers/{extinguisher_id}/services")
+def get_service_history(
+    extinguisher_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == extinguisher_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not extinguisher:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Extinguisher not found"
+        )
+
+    return (
+        db.query(Service)
+        .filter(Service.extinguisher_id == extinguisher_id)
+        .all()
+    )
+
+
+@router.get("/extinguishers/{extinguisher_id}/service-history")
+def get_extinguisher_service_history(
+    extinguisher_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == extinguisher_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not extinguisher:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Extinguisher does not exist"
+        )
+
+    services = (
+        db.query(Service)
+        .filter(Service.extinguisher_id == extinguisher_id)
+        .order_by(Service.service_date.desc())
+        .all()
+    )
+
+    return {
+        "extinguisher": extinguisher,
+        "total_services": len(services),
+        "services": services
+    }
+
+
+# -------------------------------------------------------------
+# Service Endpoints
+# -------------------------------------------------------------
 
 @router.get("/services")
 def get_services(
     page: int = 1,
     limit: int = 10,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     if page < 1:
         page = 1
@@ -580,10 +794,17 @@ def get_services(
     if limit < 1:
         limit = 10
 
-    total = db.query(Service).count()
+    query = (
+        db.query(Service)
+        .join(Extinguisher, Service.extinguisher_id == Extinguisher.id)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(Customer.user_id == current_user.id)
+    )
+
+    total = query.count()
 
     services = (
-        db.query(Service)
+        query
         .order_by(Service.service_date.desc())
         .offset((page - 1) * limit)
         .limit(limit)
@@ -598,90 +819,199 @@ def get_services(
     }
 
 
-# Service history on a particular extinguisher endpoint
-
-@router.get("/extinguishers/{extinguisher_id}/services")
-def get_service_history(extinguisher_id: int, db: Session = Depends(get_db)):
-    extinguisher = db.query(Extinguisher).filter(Extinguisher.id == extinguisher_id).first()
-    if not extinguisher:
-        raise HTTPException(
-            status_code=404,
-            detail="Extinguisher not found"
-        )
-    return db.query(Service).filter(Service.extinguisher_id == extinguisher_id).all()
-
-
-# Service history on a particular extinguisher endpoint
-
-@router.get("/extinguishers/{extinguisher_id}/service-history")
-def get_extinguisher_service_history(
-    extinguisher_id: int,
-    db: Session = Depends(get_db)
+@router.post("/services")
+def create_service(
+    service: ServiceCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    extinguisher = db.query(Extinguisher).filter(
-        Extinguisher.id == extinguisher_id
-    ).first()
+    extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == service.extinguisher_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not extinguisher:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Extinguisher does not exist"
         )
 
-    services = db.query(Service).filter(
-        Service.extinguisher_id == extinguisher_id
-    ).order_by(
-        Service.service_date.desc()
-    ).all()
+    new_service = Service(
+        extinguisher_id=service.extinguisher_id,
+        service_type=service.service_type,
+        service_date=service.service_date,
+        next_service_date=service.next_service_date,
+        amount=str(service.amount) if service.amount is not None else None,
+        remarks=service.remarks
+    )
+    db.add(new_service)
 
-    return {
-        "extinguisher": extinguisher,
-        "total_services": len(services),
-        "services": services
-    }
+    # Update extinguisher dates
+    extinguisher.last_service_date = service.service_date
+    if service.next_service_date:
+        extinguisher.next_service_date = service.next_service_date
 
-# Service history on a particular customer endpoint
-
-@router.get("/customers/{customer_id}/services")
-def get_customer_services(
-    customer_id: int,
-    db: Session = Depends(get_db)
-):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
-
-    if not customer:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer does not exist"
-        )
-
-    services = (
-        db.query(Service)
-        .join(
-            Extinguisher,
-            Service.extinguisher_id == Extinguisher.id
-        )
+    # Mark corresponding unread notifications as read
+    old_notifications = (
+        db.query(Notification)
         .filter(
-            Extinguisher.customer_id == customer_id
+            Notification.extinguisher_id == service.extinguisher_id,
+            Notification.notification_type == "SERVICE_DUE",
+            Notification.is_read == False
         )
         .all()
     )
-    return services
+
+    for notification in old_notifications:
+        notification.is_read = True
+
+    db.commit()
+    db.refresh(new_service)
+    return new_service
 
 
+@router.put("/services/{service_id}")
+def update_service(
+    service_id: int,
+    service: ServiceCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    existing_service = (
+        db.query(Service)
+        .join(Extinguisher, Service.extinguisher_id == Extinguisher.id)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Service.id == service_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
-# Dashboard endpoint to get total customers, extinguishers, and services
+    if not existing_service:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Service does not exist"
+        )
+
+    extinguisher = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Extinguisher.id == service.extinguisher_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not extinguisher:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Extinguisher does not exist"
+        )
+
+    existing_service.extinguisher_id = service.extinguisher_id
+    existing_service.service_type = service.service_type
+    existing_service.service_date = service.service_date
+    existing_service.next_service_date = service.next_service_date
+    existing_service.amount = str(service.amount) if service.amount is not None else None
+    existing_service.remarks = service.remarks
+
+    extinguisher.last_service_date = service.service_date
+    if service.next_service_date:
+        extinguisher.next_service_date = service.next_service_date
+
+    db.commit()
+    db.refresh(existing_service)
+
+    return existing_service
+
+
+@router.delete("/services/{service_id}")
+def delete_service(
+    service_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    service = (
+        db.query(Service)
+        .join(Extinguisher, Service.extinguisher_id == Extinguisher.id)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(
+            Service.id == service_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
+
+    if not service:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Service does not exist"
+        )
+
+    extinguisher_id = service.extinguisher_id
+
+    db.delete(service)
+    db.commit()
+
+    latest_service = (
+        db.query(Service)
+        .filter(Service.extinguisher_id == extinguisher_id)
+        .order_by(Service.service_date.desc())
+        .first()
+    )
+
+    extinguisher = db.query(Extinguisher).filter(Extinguisher.id == extinguisher_id).first()
+
+    if extinguisher:
+        if latest_service:
+            extinguisher.last_service_date = latest_service.service_date
+            extinguisher.next_service_date = latest_service.next_service_date
+        else:
+            extinguisher.last_service_date = None
+            extinguisher.next_service_date = None
+        db.commit()
+
+    return {
+        "message": "Service deleted successfully",
+        "service_id": service_id
+    }
+
+
+# -------------------------------------------------------------
+# Dashboard Summary Endpoint
+# -------------------------------------------------------------
 
 @router.get("/dashboard/summary")
-def get_dashboard_summary(db: Session = Depends(get_db)):
+def get_dashboard_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     today = date.today()
     next_30_days = today + timedelta(days=30)
 
-    customers_count = db.query(Customer).count()
-    extinguishers = db.query(Extinguisher).all()
-    services_count = db.query(Service).count()
+    customers_count = db.query(Customer).filter(Customer.user_id == current_user.id).count()
+
+    extinguishers = (
+        db.query(Extinguisher)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(Customer.user_id == current_user.id)
+        .all()
+    )
+
+    services_count = (
+        db.query(Service)
+        .join(Extinguisher, Service.extinguisher_id == Extinguisher.id)
+        .join(Customer, Extinguisher.customer_id == Customer.id)
+        .filter(Customer.user_id == current_user.id)
+        .count()
+    )
 
     due_count = 0
     upcoming_count = 0
@@ -690,15 +1020,16 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
         if not extinguisher.next_service_date:
             continue
 
-        service_date = date.fromisoformat(
-            str(extinguisher.next_service_date)
-        )
-
-        if service_date <= today:
-            due_count += 1
-
-        elif service_date <= next_30_days:
-            upcoming_count += 1
+        try:
+            service_date = date.fromisoformat(
+                str(extinguisher.next_service_date)
+            )
+            if service_date <= today:
+                due_count += 1
+            elif service_date <= next_30_days:
+                upcoming_count += 1
+        except ValueError:
+            continue
 
     return {
         "total_customers": customers_count,
@@ -709,13 +1040,16 @@ def get_dashboard_summary(db: Session = Depends(get_db)):
     }
 
 
-# Notification endpoints
+# -------------------------------------------------------------
+# Notification Endpoints
+# -------------------------------------------------------------
 
 @router.get("/notifications")
 def get_notifications(
     page: int = 1,
     limit: int = 10,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     if page < 1:
         page = 1
@@ -723,9 +1057,7 @@ def get_notifications(
     if limit < 1:
         limit = 10
 
-    total = db.query(Notification).count()
-
-    notifications = (
+    query = (
         db.query(
             Notification,
             Customer.name,
@@ -742,7 +1074,16 @@ def get_notifications(
             Extinguisher,
             Notification.extinguisher_id == Extinguisher.id
         )
+        .filter(
+            Customer.user_id == current_user.id
+        )
         .order_by(Notification.created_at.desc())
+    )
+
+    total = query.count()
+
+    notifications = (
+        query
         .offset((page - 1) * limit)
         .limit(limit)
         .all()
@@ -777,21 +1118,26 @@ def get_notifications(
         "notifications": result
     }
 
-# Mark notification as read endpoint
 
 @router.put("/notifications/{notification_id}/read")
 def mark_notification_as_read(
     notification_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-
-    notification = db.query(Notification).filter(
-        Notification.id == notification_id
-    ).first()
+    notification = (
+        db.query(Notification)
+        .join(Customer, Notification.customer_id == Customer.id)
+        .filter(
+            Notification.id == notification_id,
+            Customer.user_id == current_user.id
+        )
+        .first()
+    )
 
     if not notification:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Notification does not exist"
         )
 
@@ -803,30 +1149,40 @@ def mark_notification_as_read(
     return notification
 
 
-# unread notifications count endpoint
-
 @router.get("/notifications/unread-count")
 def get_unread_notification_count(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    unread_count = db.query(Notification).filter(
-        Notification.is_read == False
-    ).count()
+    unread_count = (
+        db.query(Notification)
+        .join(Customer, Notification.customer_id == Customer.id)
+        .filter(
+            Customer.user_id == current_user.id,
+            Notification.is_read == False
+        )
+        .count()
+    )
 
     return {
         "unread_count": unread_count
     }
 
 
-# Mark all notifications as read endpoint
-
 @router.put("/notifications/read-all")
 def mark_all_notifications_as_read(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    notifications = db.query(Notification).filter(
-        Notification.is_read == False
-    ).all()
+    notifications = (
+        db.query(Notification)
+        .join(Customer, Notification.customer_id == Customer.id)
+        .filter(
+            Customer.user_id == current_user.id,
+            Notification.is_read == False
+        )
+        .all()
+    )
 
     for notification in notifications:
         notification.is_read = True
@@ -836,89 +1192,4 @@ def mark_all_notifications_as_read(
     return {
         "message": "All notifications marked as read",
         "updated_count": len(notifications)
-    }
-
-
-# Get Notification for a particular customer endpoint
-
-@router.get("/customers/{customer_id}/notifications")
-def get_customer_notifications(
-    customer_id: int,
-    db: Session = Depends(get_db)
-):
-    customer = db.query(Customer).filter(
-        Customer.id == customer_id
-    ).first()
-
-    if not customer:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer does not exist"
-        )
-
-    notifications = db.query(Notification).filter(
-        Notification.customer_id == customer_id
-    ).order_by(
-        Notification.created_at.desc()
-    ).all()
-
-    return notifications
-
-
-
-# Delete API's
-
-# Delete service by ID endpoint
-
-@router.delete("/services/{service_id}")
-def delete_service(
-    service_id: int,
-    db: Session = Depends(get_db)
-):
-    service = db.query(Service).filter(
-        Service.id == service_id
-    ).first()
-
-    if not service:
-        raise HTTPException(
-            status_code=404,
-            detail="Service does not exist"
-        )
-
-    extinguisher_id = service.extinguisher_id
-
-    db.delete(service)
-    db.commit()
-
-    latest_service = (
-        db.query(Service)
-        .filter(
-            Service.extinguisher_id == extinguisher_id
-        )
-        .order_by(Service.service_date.desc())
-        .first()
-    )
-
-    extinguisher = db.query(Extinguisher).filter(
-        Extinguisher.id == extinguisher_id
-    ).first()
-
-    if not extinguisher:
-        raise HTTPException(
-            status_code=404,
-            detail="Extinguisher does not exist"
-        )
-
-    if latest_service:
-        extinguisher.last_service_date = latest_service.service_date
-        extinguisher.next_service_date = latest_service.next_service_date
-    else:
-        extinguisher.last_service_date = None
-        extinguisher.next_service_date = None
-
-    db.commit()
-
-    return {
-        "message": "Service deleted successfully",
-        "service_id": service_id
     }

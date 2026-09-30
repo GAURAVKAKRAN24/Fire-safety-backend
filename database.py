@@ -4,8 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# DATABASE_URL = "postgresql://postgres:12345@localhost:5432/fire_safety_db"
-DATABASE_URL: str | None = str(os.getenv("DATABASE_URL"))
+DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:12345@localhost:5432/fire_safety_db"
 engine = create_engine(DATABASE_URL)
 
 try:
