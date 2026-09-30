@@ -30,8 +30,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:4200",
         "http://127.0.0.1:4200",
-        "https://fire-guard-app-xi.vercel.app",
-        "https://fire-guard-5ot64eb5y-gaurav-f58b.vercel.app/"
+        "https://fire-guard-app-lovat.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
