@@ -4,11 +4,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:12345@localhost:5432/fire_safety_db"
+#  or "postgresql://postgres:12345@localhost:5432/fire_safety_db"
 
-# Render / Heroku compatibility: convert postgres:// to postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+DATABASE_URL = str(os.getenv("DATABASE_URL"));
 
 engine = create_engine(DATABASE_URL)
 
